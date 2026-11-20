@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.ingest import FactPartitionStore, NaturalKeyRegistry
 from app.seed import SEED_ROWS
 
 
@@ -325,6 +326,10 @@ class Store:
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        # 维度自然键 → 正式代理键登记，以及事实分区的待匹配/回填登记。
+        self.natural_keys = NaturalKeyRegistry()
+        self.fact_partitions = FactPartitionStore()
+        _seed_natural_keys(self)
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -369,6 +374,19 @@ class Store:
             "snapshots": snapshot_info,
             "artifacts": artifact_info,
         }
+
+
+def _seed_natural_keys(repo: Store) -> None:
+    """从键值定义推导各维度起始代理键，登记为可复用的键段游标。"""
+    for config in repo.rows("surrogate_key"):
+        if config.get("status") == "已耗尽":
+            continue
+        try:
+            base = int(str(config.get("初始值", "1000000")).strip())
+        except (TypeError, ValueError):
+            base = 1000000
+        config.setdefault("下一个键", base)
+        config.setdefault("已分配数", 0)
 
 
 store = Store()

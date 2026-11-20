@@ -11,6 +11,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.ingest import (
+    MATCHED,
+    PENDING,
+    backfill_pending_facts,
+    find_fact_by_source_record,
+    pending_fact_matches,
+    write_fact_partition,
+)
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -24,6 +32,8 @@ class FactDesignService(BaseModuleService):
     STATUS_ORDER = ["草稿", "已设计", "已发布", "已冻结"]
     ACTION_RULES = {"提交设计": "草稿", "发布事实": "已设计", "冻结事实": "已发布"}
     NEGATIVE_ACTIONS = []
+    # 维度外键映射：{维度编码: (自然键字段, 代理键字段)}，未显式声明时按字段名推断。
+    FX_FIELDS = {"自然键字段": "自然键", "代理键字段": "代理键", "维度编码": "维度编码"}
 
     UPDATE_MODES = {"每日追加", "每小时追加", "T+1批量", "实时追加", "每日全量"}
 
@@ -56,6 +66,13 @@ class FactDesignService(BaseModuleService):
         entry, missing = super().create_entry(values)
         if entry is None:
             return None, missing
+
+        # 事实表持有维度自然键 → 代理键的外键映射，供分区写入复用。
+        mapping = _build_fk_mapping(entry.get("关联维度", ""), values.get("外键映射"))
+        if mapping:
+            entry["外键映射"] = mapping
+            entry["外键映射说明"] = "; ".join(
+                f"{m['维度编码']}:{m['自然键字段']}->{m['代理键字段']}" for m in mapping)
 
         # 发布事实表定义到数据通道
         store.channel.publish("fact.defined", {
@@ -124,7 +141,76 @@ class FactDesignService(BaseModuleService):
             dims = str(row.get("关联维度", "")).split(".")
             dim_matrix[fact_name] = [d for d in dims if d]
         base["dimension_association_matrix"] = dim_matrix
+
+        # 待匹配事实：事实先到、维度键迟到时的存量与分区分布。
+        pending = store.fact_partitions.pending_matches()
+        base["pending_fact_count"] = len(pending)
+        base["pending_by_fact"] = _count_by(pending, "事实名称")
+        base["pending_by_partition"] = _count_by(pending, "分区值")
+        base["fact_partition_summary"] = store.fact_partitions.summary()
         return base
+
+    # ------------------------------------------------------------------
+    # 事实入仓：按映射写分区、待匹配检索、迟到维度回填
+    # ------------------------------------------------------------------
+    def write_partitions(self, entry_id: int, values: dict[str, Any]) -> dict[str, Any]:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            raise LookupError(f"{self.ENTITY} {entry_id} 不存在或已归档")
+        records = values.get("records") or values.get("事实记录") or []
+        if not isinstance(records, list) or not records:
+            raise ValueError("请提供至少一条事实记录（records）")
+
+        partition_field = str(
+            values.get("partition_field") or values.get("分区字段") or entry.get("分区字段") or "dt"
+        ).split(" ")[0]
+        mappings = values.get("dimension_mappings") or values.get("外键映射") or entry.get("外键映射")
+        source = str(values.get("来源系统") or values.get("source") or "")
+
+        result = write_fact_partition(
+            store,
+            str(entry.get("事实名称")),
+            records,
+            partition_field=partition_field,
+            dimension_mappings=mappings,
+            business_process=str(entry.get("业务过程", "")),
+            grain=str(entry.get("粒度声明", "")),
+            source=source,
+        )
+        store.channel.publish("fact.partition_written", {
+            "fact_name": result["fact_name"],
+            "written": result["written"],
+            "pending": result["pending"],
+            "partitions": result["partitions"],
+            "entry_id": entry_id,
+        })
+        return result
+
+    def pending_matches(self, **filters: Any) -> dict[str, Any]:
+        """待匹配事实检索接口：保留来源记录、来源系统、分区和粒度。"""
+        return pending_fact_matches(store, **filters)
+
+    def backfill(self, values: dict[str, Any]) -> dict[str, Any]:
+        """维度键迟到：把先前未匹配的同一条事实关联起来，金额不翻倍。"""
+        result = backfill_pending_facts(
+            store,
+            dim_code=values.get("维度编码") or values.get("dim_code"),
+            natural_key=values.get("自然键") or values.get("natural_key"),
+            fact_name=values.get("事实名称") or values.get("fact_name"),
+            source_record_id=values.get("来源记录ID") or values.get("source_record_id"),
+        )
+        store.channel.publish("fact.backfilled", {
+            "fact_name": values.get("事实名称") or values.get("fact_name") or "",
+            "dim_code": values.get("维度编码") or values.get("dim_code") or "",
+            "natural_key": values.get("自然键") or values.get("natural_key") or "",
+            "matched": result["matched"],
+            "remaining": result["remaining"],
+        })
+        return result
+
+    def by_source_record(self, source_record_id: str, fact_name: str | None = None) -> dict[str, Any]:
+        """按源记录检索事实分区，回填前后都能定位到同一条事实和金额。"""
+        return find_fact_by_source_record(store, source_record_id, fact_name=fact_name)
 
 
 def _validate_dimensions(dim_str: str) -> list[str]:
@@ -149,6 +235,49 @@ def _validate_fact_dim_completeness(entry: dict[str, Any]) -> dict[str, Any]:
     if missing:
         return {"valid": False, "message": f"维度 {'、'.join(missing)} 未定义，请先创建维度定义"}
     return {"valid": True, "message": ""}
+
+
+def _build_fk_mapping(related_dims: str, declared: Any) -> list[dict[str, str]]:
+    """把关联维度转成显式外键映射，按约定字段名推断自然键与代理键列。"""
+    mapping: list[dict[str, str]] = []
+    if isinstance(declared, list):
+        for item in declared:
+            if isinstance(item, dict) and item.get("维度编码"):
+                mapping.append({
+                    "维度编码": str(item["维度编码"]),
+                    "自然键字段": str(item.get("自然键字段") or "自然键"),
+                    "代理键字段": str(item.get("代理键字段") or ""),
+                })
+    elif isinstance(declared, dict):
+        for dim_code, spec in declared.items():
+            if isinstance(spec, str):
+                mapping.append({"维度编码": str(dim_code), "自然键字段": spec, "代理键字段": ""})
+            elif isinstance(spec, dict):
+                mapping.append({
+                    "维度编码": str(dim_code),
+                    "自然键字段": str(spec.get("自然键字段") or "自然键"),
+                    "代理键字段": str(spec.get("代理键字段") or ""),
+                })
+
+    existing = {m["维度编码"] for m in mapping}
+    for dim_code in (d.strip() for d in str(related_dims or "").split(".")):
+        if not dim_code or dim_code in existing:
+            continue
+        stem = dim_code.lower().replace("dim_", "")
+        mapping.append({
+            "维度编码": dim_code,
+            "自然键字段": f"{stem}_nk",
+            "代理键字段": f"{stem}_sk",
+        })
+    return mapping
+
+
+def _count_by(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get(field, ""))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def _suggest_measures(fact: dict[str, Any]) -> None:
